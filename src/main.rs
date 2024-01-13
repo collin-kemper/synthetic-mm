@@ -12,8 +12,9 @@ fn main() {
   let mut parser = parser::Parser::new(fname).unwrap();
   let mmdb = parser.parse();
   // parser.display_asserts();
-  // mmdb.print_mm();
-  mmdb.test_proof_graph();
+  // mmdb.test_proof_graph();
+  mmdb.print_mm();
+  mmdb.test_unfold();
   // parser.get_assert_types();
 
   // let mut rng = rand::thread_rng();
