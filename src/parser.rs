@@ -6,6 +6,21 @@ use std::io::BufReader;
 
 use crate::mmdb::*;
 
+#[derive(PartialEq, Eq, Clone)]
+enum SymbolType {
+  Var,
+  TypelessVar,
+  Const,
+  Hyp,
+  Assert,
+}
+
+#[derive(PartialEq, Eq, Clone)]
+struct Symbol {
+  pub t: SymbolType,
+  pub id: u32,
+}
+
 /* -------------- tokens --------------- */
 const TOK_EOF      : u8 = 0x00; /* end of file */
 const TOK_WSP      : u8 = 0x01; /* whitespace */
@@ -151,8 +166,10 @@ pub struct Parser {
 
   // symbols and data
   sym_map:       HashMap<Vec<u8>, Symbol>,
+  // TODO: maybe unnecessary?
   hyp_names: Vec<Vec<u8>>,
-  in_scope_hyps: Vec<u32>,
+  // in_scope_hyps: Vec<u32>,
+  hyps: Vec<Hypothesis>,
   in_scope_disjoint_vars: HashSet<(u32, u32)>,
 }
 
@@ -165,7 +182,7 @@ impl Parser {
 
       sym_map:     HashMap::new(),
       hyp_names:   Vec::new(),
-      in_scope_hyps: Vec::new(),
+      hyps: Vec::new(),
       in_scope_disjoint_vars: HashSet::new(),
     })
   }
@@ -201,27 +218,6 @@ impl Parser {
     }
   }
 
-  fn get_variable(&mut self) -> u32 {
-    let mut symbol = Vec::<u8>::new();
-    loop {
-      let tok = self.r.next();
-      match tok {
-        TOK_WSP => continue,
-        0x21u8..=0x23u8 | 0x25u8..=0x7eu8 => { /* printable ASCII minus '$' */
-          symbol.push(tok);
-          self.consume_symbol(&mut symbol);
-
-          let sym = self.sym_map.get(&symbol).unwrap();
-          if sym.t != SymbolType::Var {
-            panic!("invalid");
-          }
-          return sym.id;
-        },
-        _ => panic!("invalid"),
-      }
-    }
-  }
-
   fn consume_tok_dot(&mut self) {
     loop {
       match self.r.next() {
@@ -234,27 +230,60 @@ impl Parser {
 
   fn parse_floating(&mut self, mmdb: &mut MmDb, name: Vec<u8>) -> u32 {
     let t = self.get_typecode();
-    let var = self.get_variable();
+    // get variable
+    let mut symbol = Vec::<u8>::new();
+    let var_id = loop {
+      let tok = self.r.next();
+      match tok {
+        TOK_WSP => continue,
+        0x21u8..=0x23u8 | 0x25u8..=0x7eu8 => { /* printable ASCII minus '$' */
+          symbol.push(tok);
+          self.consume_symbol(&mut symbol);
+
+          let sym = self.sym_map.get_mut(&symbol).unwrap();
+          if sym.t == SymbolType::TypelessVar {
+            let name = String::from_utf8(symbol.clone()).unwrap();
+            let var_id = mmdb.add_variable(name, t);
+            sym.t = SymbolType::Var;
+            sym.id = var_id;
+            break var_id;
+          } else if sym.t == SymbolType::Var {
+            break sym.id;
+          } else {
+            panic!("invalid");
+          }
+        },
+        _ => panic!("invalid"),
+      }
+    };
     self.consume_tok_dot();
-    let id = mmdb.add_floating(t, var);
-    self.hyp_names.push(name);
-    self.in_scope_hyps.push(id);
-    return id;
+    // TODO
+    // let id = mmdb.add_floating(t, var);
+    // add if typeless
+    // self.hyp_names.push(name);
+    let hyp_id = self.hyps.len() as u32;
+    self.hyps.push(Hypothesis::F(VarDecl { t, var: var_id }));
+    return hyp_id;
   }
 
-  fn get_symbol_str(&mut self) -> Vec<Symbol> {
-    let mut sym_str = Vec::<Symbol>::new();
+  fn get_words(&mut self) -> Vec<Word> {
+    let mut words = Vec::<Word>::new();
     let mut sym_name = Vec::<u8>::new();
     loop {
       let tok = self.r.next();
       match tok {
         TOK_WSP => {
           if sym_name.len() > 0 {
-            sym_str.push(self.sym_map.get(&sym_name).unwrap().clone());
+            let sym = self.sym_map.get(&sym_name).unwrap();
+            match sym.t {
+              SymbolType::Const => words.push(Word::Const(sym.id)),
+              SymbolType::Var => words.push(Word::Var(sym.id)),
+              _ => panic!("invalid"),
+            }
             sym_name.clear();
           }
         },
-        TOK_DOT => return sym_str,
+        TOK_DOT => return words,
         /* printable ASCII minus '$' */
         0x21u8..=0x23u8 | 0x25u8..=0x7eu8 => sym_name.push(tok),
         _ => panic!("invalid"),
@@ -264,51 +293,52 @@ impl Parser {
 
   fn parse_essential(&mut self, mmdb: &mut MmDb, name: Vec<u8>) -> u32 {
     let t = self.get_typecode();
-    let syms = self.get_symbol_str();
-    let id = mmdb.add_essential(t, syms);
-    self.hyp_names.push(name);
-    self.in_scope_hyps.push(id);
-    return id;
+    let words = self.get_words();
+    // TODO
+    // let id = mmdb.add_essential(t, syms);
+    // self.hyp_names.push(name);
+    let hyp_id = self.hyps.len() as u32;
+    self.hyps.push(Hypothesis::E(Sentence { t, words }));
+    return hyp_id;
   }
 
   /**makes a map of label names to for mandatory hypotheses id.
    * A hypothesis id is the 0..n-1 for an assertion that has n mandatory
    * hypotheses.
    */
-  fn make_label_map(&self, mmdb: &MmDb, mand_vars: &HashSet<u32>) -> HashMap<Vec<u8>, ProofStep> {
-    let mut map = HashMap::<Vec<u8>, ProofStep>::new();
-    let mut mand_hyp_count = 0;
-    for id in self.in_scope_hyps.iter() {
-      let h = &mmdb.hyps[*id as usize];
-      let name = &self.hyp_names[*id as usize];
-      match h {
-        Hypothesis::F(decl) =>
-          if mand_vars.contains(&decl.var) {
-            map.insert(name.clone(), ProofStep::Hyp(mand_hyp_count));
-            mand_hyp_count += 1;
-          },
-        Hypothesis::E(_) => {
-          map.insert(name.clone(), ProofStep::Hyp(mand_hyp_count));
-          mand_hyp_count += 1;
-        },
-      }
-    }
-    return map;
-  }
+  // fn make_label_map(&self, mmdb: &MmDb, mand_vars: &HashSet<u32>) -> HashMap<Vec<u8>, ProofStep> {
+  //   let mut map = HashMap::<Vec<u8>, ProofStep>::new();
+  //   let mut mand_hyp_count = 0;
+  //   for id in self.in_scope_hyps.iter() {
+  //     let h = &mmdb.hyps[*id as usize];
+  //     let name = &self.hyp_names[*id as usize];
+  //     match h {
+  //       Hypothesis::F(decl) =>
+  //         if mand_vars.contains(&decl.var) {
+  //           map.insert(name.clone(), ProofStep::Hyp(mand_hyp_count));
+  //           mand_hyp_count += 1;
+  //         },
+  //       Hypothesis::E(_) => {
+  //         map.insert(name.clone(), ProofStep::Hyp(mand_hyp_count));
+  //         mand_hyp_count += 1;
+  //       },
+  //     }
+  //   }
+  //   return map;
+  // }
 
-  fn get_referenced_vars(&self, mmdb: &MmDb, sym_str: &SymStr) -> HashSet<u32> {
+  fn get_mandatory_vars(&self, sentence: &Sentence) -> HashSet<u32> {
     let mut vars = HashSet::<u32>::new();
-    for sym in &sym_str.syms {
-      if sym.t == SymbolType::Var {
-        vars.insert(sym.id);
+    for word in &sentence.words {
+      if let Word::Var(id) = word {
+        vars.insert(*id);
       }
     }
-    for id in self.in_scope_hyps.iter() {
-      let h = &mmdb.hyps[*id as usize];
+    for h in self.hyps.iter() {
       if let Hypothesis::E(ss) = h {
-        for sym in &ss.syms {
-          if sym.t == SymbolType::Var {
-            vars.insert(sym.id);
+        for word in &ss.words {
+          if let Word::Var(id) = word {
+            vars.insert(*id);
           }
         }
       }
@@ -317,10 +347,9 @@ impl Parser {
     return vars;
   }
 
-  fn get_mandatory_hyps(&self, mmdb: &MmDb, mand_vars: &HashSet<u32>) -> Vec<Hypothesis> {
+  fn get_mandatory_hyps(&self, mand_vars: &HashSet<u32>) -> Vec<Hypothesis> {
     let mut hyps = Vec::<Hypothesis>::new();
-    for id in self.in_scope_hyps.iter() {
-      let h = &mmdb.hyps[*id as usize];
+    for h in self.hyps.iter() {
       match h {
         Hypothesis::F (decl) =>
           if mand_vars.contains(&decl.var) {
@@ -344,19 +373,19 @@ impl Parser {
 
   fn parse_axiom(&mut self, mmdb: &mut MmDb, name: String) -> u32 {
     let t = self.get_typecode();
-    let syms = self.get_symbol_str();
-    let consequent = SymStr { t, syms };
-    let vars = self.get_referenced_vars(mmdb, &consequent);
-    let hyps = self.get_mandatory_hyps(mmdb, &vars);
+    let words = self.get_words();
+    let consequent = Sentence { t, words };
+    let vars = self.get_mandatory_vars(&consequent);
+    let hyps = self.get_mandatory_hyps(&vars);
     let disjoint_vars = self.get_disjoint_vars(&vars);
 
     return mmdb.add_axiom(name, hyps, consequent, disjoint_vars);
   }
 
-  fn parse_compressed_proof(&mut self, mmdb: &mut MmDb, name: String, consequent: SymStr) -> u32 {
-    let mand_vars = self.get_referenced_vars(mmdb, &consequent);
+  fn parse_compressed_proof(&mut self, mmdb: &mut MmDb, name: String, consequent: Sentence) -> u32 {
+    let mand_vars = self.get_mandatory_vars(&consequent);
     // let mut opt_vars = HashSet::<u32>::new();
-    let hyps = self.get_mandatory_hyps(mmdb, &mand_vars);
+    let hyps = self.get_mandatory_hyps(&mand_vars);
 
     /* get labels */
     let mut sym_name = Vec::<u8>::new();
@@ -368,15 +397,18 @@ impl Parser {
           if sym_name.len() > 0 {
             let sym = self.sym_map.get(&sym_name).unwrap();
             sym_name.clear();
-            if sym.t != SymbolType::Hyp && sym.t != SymbolType::Assert {
+            if sym.t == SymbolType::Hyp {
+              match &self.hyps[sym.id as usize] {
+                Hypothesis::F(decl) => {
+                  deps.push(Symbol { t: SymbolType::Var, id: decl.var });
+                },
+                Hypothesis::E(_) => panic!("invalid"),
+              }
+            } else if sym.t == SymbolType::Assert {
+              deps.push(sym.clone())
+            } else {
               panic!("invalid");
             }
-            // if sym.t == SymbolType::Hyp {
-            //   if let Hypothesis::F(decl) = self.hyps[sym.id as usize] {
-            //     opt_vars.insert(decl.var);
-            //   }
-            // }
-            deps.push(sym.clone());
           }          
         },
         ASCII_RPAR => {
@@ -400,7 +432,12 @@ impl Parser {
       let tok = self.r.next();
       match tok {
         TOK_WSP => continue,
-        TOK_DOT => break,
+        TOK_DOT => {
+          if num != 0 {
+            panic!("invalid");
+          }
+          break;
+        },
         ASCII_A..=ASCII_T => {
           num = 20 * num;
           num += (tok - ASCII_A) as usize;
@@ -417,7 +454,13 @@ impl Parser {
           // label
           num -= hyps.len();
           if num < deps.len() {
-            proof.push(ProofStep::Dep(num as u32));
+            let dep = &deps[num as usize];
+            match dep.t {
+              SymbolType::Var => proof.push(ProofStep::Var(dep.id)),
+              SymbolType::Assert => proof.push(ProofStep::Assert(dep.id)),
+              _ => panic!("invalid"),
+            }
+            // proof.push(ProofStep::Dep(num as u32));
 
             statement_count += 1;
             num = 0;
@@ -453,21 +496,26 @@ impl Parser {
     }
 
     let disjoint_vars = self.get_disjoint_vars(&mand_vars);
-    return mmdb.add_theorem(name, hyps, consequent, disjoint_vars, deps, proof);
+    return mmdb.add_theorem(name, hyps, consequent, disjoint_vars, proof);
   }
 
   fn parse_proof(&mut self, mmdb: &mut MmDb, name: String) -> u32 {
     let t = self.get_typecode();
 
     /* get proof symbol str */
-    let mut consequent = SymStr::new(t);
+    let mut consequent = Sentence::new(t);
     let mut sym_name = Vec::<u8>::new();
     loop {
       let tok = self.r.next();
       match tok {
         TOK_WSP => {
           if sym_name.len() > 0 {
-            consequent.syms.push(self.sym_map.get(&sym_name).unwrap().clone());
+            let sym = self.sym_map.get(&sym_name).unwrap();
+            match sym.t {
+              SymbolType::Const => consequent.words.push(Word::Const(sym.id)),
+              SymbolType::Var => consequent.words.push(Word::Var(sym.id)),
+              _ => panic!("invalid"),
+            }
             sym_name.clear();
           }
         },
@@ -627,11 +675,11 @@ impl Parser {
               // scope. 
               match sym.t {
                 SymbolType::Var => {},
+                SymbolType::TypelessVar => {},
                 _ => panic!("invalid"),
               }
             } else {
-              let id = mmdb.add_variable(String::from_utf8(symbol.clone()).unwrap());
-              self.sym_map.insert(symbol.clone(), Symbol { t: SymbolType::Var, id: id });
+              self.sym_map.insert(symbol.clone(), Symbol { t: SymbolType::TypelessVar, id: 0 });
             }
             symbol.clear();
           }
@@ -752,6 +800,7 @@ impl Parser {
           label.clear();
         },
         TOK_CONST => {
+          // const declarations must be at the top level.
           if hyps_len_stack.len() > 0 {
             panic!("invalid");
           }
@@ -761,7 +810,7 @@ impl Parser {
         TOK_BLOCK_START => {
           scope_local_names_stack.push(scope_local_names);
           scope_local_names = HashSet::new();
-          hyps_len_stack.push(self.in_scope_hyps.len());
+          hyps_len_stack.push(self.hyps.len());
           disjoint_vars_stack.push(self.in_scope_disjoint_vars.clone());
         },
         TOK_BLOCK_END   => {
@@ -769,10 +818,12 @@ impl Parser {
             self.sym_map.remove(name);
           }
           scope_local_names = scope_local_names_stack.pop().unwrap();
-          self.in_scope_hyps.truncate(hyps_len_stack.pop().unwrap());
+          self.hyps.truncate(hyps_len_stack.pop().unwrap());
           self.in_scope_disjoint_vars = disjoint_vars_stack.pop().unwrap();
         },
         TOK_DISJOINT    => self.parse_disjoint_decl(),
+        // TODO: this is incorrect -- what happens if we get e.g.
+        // TOK_DISJOINT after a label without whitespace?
         ASCII_0..=ASCII_9
         | ASCII_a..=ASCII_z
         | ASCII_A..=ASCII_Z
