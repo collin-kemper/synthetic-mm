@@ -127,6 +127,14 @@ struct ProofNode {
   step: ProofStep,
 }
 
+/* TODO: this could be optimized, as we know that once a node
+ * has been added, it will never have edges added. I.e., each node
+ * has a fixed number of edges, though a node when being added could
+ * have any number of edges. 
+ * the optimization would be to make edges not a Vec<Vec<usize>>,
+ * but Vec<usize>, with each node storing the number of hypotheses,
+ * and the start of the hypotheses within the Vec.
+ */
 struct ProofGraph {
   nodes: Vec<ProofNode>,
   root: usize,
@@ -390,12 +398,8 @@ impl MmDb {
       proof,
     };
 
-    println!("$(");
-    println!("{}:", theorem.name);
-    for (i, step) in theorem.proof.iter().enumerate() {
-      println!("{:>4}: {:?}", i, step);
-    }
-    println!("$)");
+    // println!("$(");
+    // println!("$( adding theorem {} $)", theorem.name);
 
     self.check_proof_validity(&theorem);
 
@@ -421,6 +425,7 @@ impl MmDb {
     if stack.len() < assert.hyps.len() {
       panic!("invalid");
     }
+
 
     // construct variable map and check that the stack matches assert's
     // hypotheses
@@ -471,14 +476,8 @@ impl MmDb {
     let mut var_var_map = HashMap::<u32, Vec<u32>>::new();
     let mut var_set = HashSet::<u32>::new();
     for (v, words) in var_map.iter() {
-      if !mand_vars.contains(v) {
-        continue;
-      }
       for w in words {
         if let Word::Var(id) = w {
-          if !mand_vars.contains(id) {
-            continue;
-          }
           var_set.insert(*id);
         }
       }
@@ -491,12 +490,17 @@ impl MmDb {
 
     // Then, for every set of variables that must be disjoint, check that
     // their substitutions are disjoint.
+    // All non-mandatory variables are disjoint.
     for (a, b) in &assert.disjoint_vars {
-      if !mand_vars.contains(a) || !mand_vars.contains(b) {
-        continue;
-      }
       for s0 in var_var_map.get(a).unwrap() {
         for s1 in var_var_map.get(b).unwrap() {
+          if !mand_vars.contains(s0) || !mand_vars.contains(s1) {
+            // if either is optional, and they are not the same, continue
+            if *s0 == *s1 {
+              panic!("invalid");
+            }
+            continue;
+          }
           if s0 < s1 {
             if !disjoint_vars.contains(&(*s0, *s1)) {
               panic!("invalid");
@@ -542,8 +546,8 @@ impl MmDb {
     let mut saved_statements = Vec::<Sentence>::new();
     let mand_vars = theorem.get_mand_var_set();
 
-    let mut i = 0;
-    for step in theorem.proof.iter() {
+    for (step_id, step) in theorem.proof.iter().enumerate() {
+      // println!("step {:<4}: {:?}", step_id, step);
       match step {
         ProofStep::Hyp(id) => {
           let hyp = &theorem.hyps[*id as usize];
@@ -555,6 +559,14 @@ impl MmDb {
         },
         ProofStep::Assert(id) => {
           let assert = &self.asserts[*id as usize];
+          // // DEBUG
+          // let hyp_start = stack.len() - assert.hyps.len();
+          // println!("stack:");
+          // for i in 0..assert.hyps.len() {
+          //   println!("{:>4}: {}", i, self.render_sentence(&stack[hyp_start + i]));
+          // }
+          // println!("assert:");
+          // self.print_assert_statement(assert);
           MmDb::apply(&mut stack, assert, &mand_vars, &disjoint_var_set);
         },
         ProofStep::Saved(id) => {
@@ -562,6 +574,7 @@ impl MmDb {
           stack.push(st);
         },
       }
+      // println!("top of stack: {}", self.render_sentence(&stack[stack.len()-1]));
       saved_statements.push(stack[stack.len()-1].clone());
     }
 
@@ -671,152 +684,134 @@ impl MmDb {
   //   remap_ss(&mut assert.consequent, &var_var_map);
   // }
 
-  /**Go through all optional variables of assertion, and if they are
+  /**Go through all optional variables of a proof, and if they are
    * in the excluded vars set, then change them to some different
    * variable.
    */
-  // fn change_optional_variables(&self,
-  //   thm: &mut Assertion,
-  //   excluded_vars: &HashSet<u32>)
-  // {
-  //   for sym in new_deps.iter() {
-  //     match sym.t {
-  //       SymbolType::Hyp => {
-  //         match self.hyps[sym.id] {
-  //           Hypothesis::F(decl) => {
-  //             if mand_vars.contains(decl.var) {
-  //               // uh oh, we need to fix this!
-                
-  //             }
-  //           },
-  //           _ => panic!("invalid"),
-  //         }
-  //       },
-  //       _ => continue,
-  //     }
-  //   }
-  // }
+  fn remap_optional_variables(&self,
+    thm: &mut Assertion,
+    excluded_vars: &HashSet<u32>)
+  {
+    println!("$( excluded_vars.len() = {} $)", excluded_vars.len());
+    let mut potential_vars = HashMap::<u32, Vec<u32>>::new();
+    for (var_id, var) in self.vars.iter().enumerate() {
+      let var_id = var_id as u32;
+      if !excluded_vars.contains(&var_id) {
+        match potential_vars.get_mut(&var.t) {
+          Some(vars) => vars.push(var_id),
+          None => { potential_vars.insert(var.t, vec![var_id]); },
+        }
+      }
+    }
+    // DEBUG
+    for (t, vars) in potential_vars.iter() {
+      println!("$( {}: vars.len() = {} $)", self.consts[*t as usize].name, vars.len());
+    }
+    let mut var_map = HashMap::<u32, u32>::new();
+    for step in thm.proof.iter_mut() {
+      match step {
+        ProofStep::Var(id) => {
+          match var_map.get(&id) {
+            Some(new_id) => *id = *new_id,
+            None => {
+              // we must remap to something that ALSO EXCLUDES CURRENT LOCAL VARIABLES!
+              // Otherwise, you might keep some local d -> d not in excluded variables,
+              // but map some b -> d when b is in the excluded variables.
+              let var = &self.vars[*id as usize];
+              let new_id = potential_vars.get_mut(&var.t).unwrap().pop().unwrap();
+              // println!("remapping {}: {} ({}) to {} ({})",
+              //   self.consts[var.t as usize].name, 
+              //   self.vars[*id as usize].name, id,
+              //   self.vars[new_id as usize].name, new_id);
+              var_map.insert(*id, new_id);
+              *id = new_id
+            }
+          }
+          
+        },
+        _ => {},
+      }
+    }
+  }
 
 
   /**Unfolding a dependency in an assertion will remove all references
    * to that dependency in the proof and will replace them with an inlined
    * proof of the dependency.
    */
-  // fn unfold(&self, name: String, thm: &Assertion, dep_id: u32) -> Assertion {
-  //   if thm.is_axiom {
-  //     panic!("invalid");
-  //   }
-  //   let to_unfold_sym = &thm.deps[dep_id as usize];
+  fn unfold(&self, name: String, thm: &Assertion, to_unfold_id: u32) -> Assertion {
+    if thm.is_axiom {
+      panic!("invalid");
+    }
+    let mut to_unfold = self.asserts[to_unfold_id as usize].clone();
 
-  //   if to_unfold_sym.t != SymbolType::Assert
-  //   || self.asserts[to_unfold_sym.id as usize].is_axiom {
-  //     // cannot unfold a hypothesis (which must be a floating hypothesis)
-  //     // cannot unfold an axiom
-  //     // alternately: unfolding an axiom is a trivial operation
-  //     let mut out = thm.clone();
-  //     out.name = name;
-  //     return out;
-  //   }
+    if to_unfold.is_axiom {
+      panic!("invalid");
+      // cannot unfold a hypothesis (which must be a floating hypothesis)
+      // cannot unfold an axiom
+      // alternately: unfolding an axiom is a trivial operation
+    }
 
-  //   // sanity check -- does the theorem contain the dependency?
-  //   let mut contains_dep = false;
-  //   for step in thm.proof.iter() {
-  //     match step {
-  //       ProofStep::Dep(id) => {
-  //         if *id == dep_id {
-  //           contains_dep = true;
-  //           break;
-  //         }
-  //       },
-  //       _ => continue,
-  //     }
-  //   }
-  //   if !contains_dep {
-  //     panic!("invalid");
-  //   }
+    // sanity check -- does the theorem contain the dependency?
+    let mut contains_dep = false;
+    for step in thm.proof.iter() {
+      match step {
+        ProofStep::Assert(id) => {
+          if *id == to_unfold_id {
+            contains_dep = true;
+            break;
+          }
+        },
+        _ => continue,
+      }
+    }
+    if !contains_dep {
+      panic!("invalid");
+    }
 
-  //   // first, remap the dependencies
-  //   let mut to_unfold = self.asserts[to_unfold_sym.id as usize].clone();
+    let all_vars = thm.get_all_var_set(self);
+    // TODO: technically, we could see all the variables that are substituted,
+    // and then check the disjoint conditions, and then re-use local variables
+    // if needed, but that is lot of work.
+    // println!("$( remapping variables for {}:", name);
+    // println!("all vars:");
+    // for var_id in all_vars.iter() {
+    //   println!("    {}: {}", var_id, self.vars[*var_id as usize].name);
+    // }
+    // println!("remapped:");
+    self.remap_optional_variables(&mut to_unfold, &all_vars);
+    // println!("$)");
 
-  //   let all_vars = thm.get_all_var_set(self);
-  //   // TODO: technically, we could see all the variables that are substituted,
-  //   // and then check the disjoint conditions, and then re-use local variables
-  //   // if needed, but that is lot of work.
-  //   self.change_optional_variables(&mut to_unfold, all_vars);
+    let mut graph = ProofGraph::from_theorem(self, &thm);
+    // println!("graph before:");
+    // graph.pretty_print();
+    let mut nodes_to_unfold = vec![];
+    for (node_id, node) in graph.nodes.iter().enumerate() {
+      if let ProofStep::Assert(id) = node.step {
+        if id == to_unfold_id {
+          nodes_to_unfold.push(node_id);
+        }
+      }
+    }
+    for node_id in nodes_to_unfold.iter() {
+      graph.unfold_theorem(*node_id, self, &to_unfold);
+    }
+    // println!("graph after:");
+    // graph.pretty_print();
 
-  //   let mut to_unfold_dep_map = Vec::<u32>::new();
-  //   let mut new_deps = thm.deps.clone();
-  //   // TODO: O(n^2), could be asymptotically improved
-  //   for dep in to_unfold.deps.iter() {
-  //     let mut dep_ind = new_deps.len();
-  //     for (i, dep0) in new_deps.iter().enumerate() {
-  //       if *dep == *dep0 {
-  //         dep_ind = i;
-  //         break;
-  //       }
-  //     }
-  //     if dep_ind >= new_deps.len() {
-  //       // push new dependency
-  //       new_deps.push(dep.clone());
-        
-  //     }
-  //     to_unfold_dep_map.push(dep_ind as u32);
-  //   }
-  //   to_unfold.deps = new_deps;
-  //   for step in to_unfold.proof.iter_mut() {
-  //     match step {
-  //       ProofStep::Dep(id) => {
-  //         *id = to_unfold_dep_map[*id as usize];
-  //       },
-  //       _ => {},
-  //     }
-  //   }
-  //   // TODO: fix deps.
-  //   // go through and get all optional vars
-  //   // need to get the set of optional variables in the dependencies.
-  //   // then union the set of optional variables.
-  //   // then remap the optional variables.
+    let new_proof = graph.to_proof();
 
-  //   let mut graph = ProofGraph::from_theorem(self, &thm);
-  //   println!("graph before:");
-  //   graph.pretty_print();
-  //   let mut nodes_to_unfold = vec![];
-  //   for (node_id, node) in graph.nodes.iter().enumerate() {
-  //     if let ProofStep::Dep(id) = node.step {
-  //       if id == dep_id {
-  //         nodes_to_unfold.push(node_id);
-  //       }
-  //     }
-  //   }
-  //   for node_id in nodes_to_unfold.iter() {
-  //     graph.unfold_theorem(*node_id, self, &to_unfold);
-  //   }
-  //   println!("graph after:");
-  //   graph.pretty_print();
+    return Assertion {
+      name,
+      is_axiom: false,
+      hyps: thm.hyps.clone(),
+      disjoint_vars: thm.disjoint_vars.clone(),
+      consequent: thm.consequent.clone(),
+      proof: new_proof,
+    };
 
-  //   // the dependency is now removed -- we can now remap all dependencies so that
-  //   // the dependency is removed.
-  //   to_unfold.deps.remove(dep_id as usize);
-  //   let mut new_proof = graph.to_proof();
-  //   for step in new_proof.iter_mut() {
-  //     if let ProofStep::Dep(id) = step {
-  //       if *id > dep_id {
-  //         *id -= 1;
-  //       }
-  //     }
-  //   }
-  //   return Assertion {
-  //     name,
-  //     is_axiom: false,
-  //     hyps: thm.hyps.clone(),
-  //     disjoint_vars: thm.disjoint_vars.clone(),
-  //     consequent: thm.consequent.clone(),
-  //     deps: to_unfold.deps,
-  //     proof: new_proof,
-  //   };
-
-  //   // TODO: should probably make sure that it is maximally simplified.
-  // }
+    // TODO: should probably make sure that it is maximally simplified.
+  }
 
   // Rendering functions
   
@@ -866,18 +861,98 @@ impl MmDb {
     return String::from_utf8(buf).unwrap()
   }
 
-  fn print_assert(&self, assert: &Assertion) {
-    println!("${{");
+  fn print_assert_statement(&self, assert: &Assertion) {
+    // hypotheses
+    for (i, hyp) in assert.hyps.iter().enumerate() {
+      println!("\t{}.h{} {}", assert.name, i, self.render_hyp(hyp));
+    }
 
     // disjoints
-    println!("$( assert.disjoint_vars.len() = {} $)", assert.disjoint_vars.len());
     for (a, b) in assert.disjoint_vars.iter() {
       println!("\t$d {} {} $.", self.vars[*a as usize].name, self.vars[*b as usize].name);
     }
+    if assert.is_axiom {
+      println!("\t{} $a {} $.", assert.name, self.render_sentence(&assert.consequent));
+    } else {
+      let hyps_len = assert.hyps.len() as u32;
+      // TODO: we could go through the proof and determine which are necessary.
+      let mut opt_vars = Vec::<u32>::new();
+      let mut var_to_enc = HashMap::<u32, u32>::new();
+      let mut assert_to_enc = HashMap::<u32, u32>::new();
+      let mut dependencies = vec![];
+      for step in assert.proof.iter() {
+        match step {
+          ProofStep::Var(id) => {
+            if var_to_enc.get(id).is_none() {
+              var_to_enc.insert(*id, hyps_len + dependencies.len() as u32);
+              dependencies.push(step);
+              opt_vars.push(*id);
+            }
+          },
+          ProofStep::Assert(id) => {
+            if assert_to_enc.get(id).is_none() {
+              assert_to_enc.insert(*id, hyps_len + dependencies.len() as u32);
+              dependencies.push(step);
+            }
+          },
+          _ => continue,
+        }
+      }
+      let deps_len = dependencies.len() as u32;
+
+      // optional variables
+      println!("\t$( optional variables $)");
+      for step in dependencies.iter() {
+        match step {
+          ProofStep::Var(id) => {
+            let var = &self.vars[*id as usize];
+            println!("\t{}.opt.{} $f {} {} $.",
+              assert.name, self.vars[*id as usize].name, 
+              self.consts[var.t as usize].name,
+              var.name);
+          },
+          _ => continue,
+        }
+      }
+
+      println!("\n\t$( optional disjoint statements $)");
+      // disjoint statements for optional variables
+      if opt_vars.len() > 0 {
+        // all optional variables are distinct from each other.
+        if opt_vars.len() > 1 {
+          print!("\t$d");
+          for var in opt_vars.iter() {
+            print!(" {}", self.vars[*var as usize].name);
+          }
+          println!(" $.");
+        }
+        // all optional variables are distinct from each mandatory variable
+        let mand_vars = assert.get_mand_var_set();
+        for mand_var in mand_vars.iter() {
+          print!("\t$d {}", self.vars[*mand_var as usize].name);
+          for var in opt_vars.iter() {
+            print!(" {}", self.vars[*var as usize].name);
+          }
+          println!(" $.");
+        }
+      }
+      println!("");
+
+      println!("\t{} $p {} $.", assert.name, self.render_sentence(&assert.consequent));
+    }
+  }
+
+  fn print_assert(&self, assert: &Assertion) {
+    println!("${{");
 
     // hypotheses
     for (i, hyp) in assert.hyps.iter().enumerate() {
       println!("\t{}.h{} {}", assert.name, i, self.render_hyp(hyp));
+    }
+
+    // disjoints
+    for (a, b) in assert.disjoint_vars.iter() {
+      println!("\t$d {} {} $.", self.vars[*a as usize].name, self.vars[*b as usize].name);
     }
 
     if assert.is_axiom {
@@ -909,7 +984,22 @@ impl MmDb {
       }
       let deps_len = dependencies.len() as u32;
 
-      println!("\n$( optional disjoint statements $)");
+      // optional variables
+      println!("\t$( optional variables $)");
+      for step in dependencies.iter() {
+        match step {
+          ProofStep::Var(id) => {
+            let var = &self.vars[*id as usize];
+            println!("\t{}.opt.{} $f {} {} $.",
+              assert.name, self.vars[*id as usize].name, 
+              self.consts[var.t as usize].name,
+              var.name);
+          },
+          _ => continue,
+        }
+      }
+
+      println!("\n\t$( optional disjoint statements $)");
       // disjoint statements for optional variables
       if opt_vars.len() > 0 {
         // all optional variables are distinct from each other.
@@ -930,22 +1020,8 @@ impl MmDb {
           println!(" $.");
         }
       }
-
-      // optional variables
-      println!("$( optional variables $)");
-      for step in dependencies.iter() {
-        match step {
-          ProofStep::Var(id) => {
-            let var = &self.vars[*id as usize];
-            println!("\t{}.opt.{} $f {} {} $.",
-              assert.name, self.vars[*id as usize].name, 
-              self.consts[var.t as usize].name,
-              var.name);
-          },
-          _ => continue,
-        }
-      }
       println!("");
+
 
       println!("\t{} $p {} $=", assert.name, self.render_sentence(&assert.consequent));
 
@@ -973,8 +1049,11 @@ impl MmDb {
       let mut depended_on = vec![false; assert.proof.len()];
       for step in assert.proof.iter() {
         match step {
-          ProofStep::Saved(id) => {
-            depended_on[*id as usize] = true;
+          ProofStep::Saved(step_id) => {
+            match assert.proof[*step_id as usize] {
+              ProofStep::Assert(_) => depended_on[*step_id as usize] = true,
+              _ => {},
+            }
           },
           _ => {},
         }
@@ -989,37 +1068,45 @@ impl MmDb {
           saved_id_to_num.push(0);
         }
       }
+      // println!("$( depended_on: {:?} $)", depended_on);
 
       // print proof itself
       for (i, step) in assert.proof.iter().enumerate() {
         match step {
           ProofStep::Hyp(id) => {
             print!("{}", MmDb::num_to_mm_enc(*id));
+            // print!(" $( hyp $)");
           },
           ProofStep::Var(id) => {
             print!("{}", MmDb::num_to_mm_enc(var_to_enc[id]));
+            // print!(" $( var $)");
           },
           ProofStep::Assert(id) => {
             print!("{}", MmDb::num_to_mm_enc(assert_to_enc[id]));
             if depended_on[i] {
               print!("Z");
             }
+            // print!(" $( assert $)");
           },
           ProofStep::Saved(step) => {
             match assert.proof[*step as usize] {
               ProofStep::Hyp(id) => {
                 print!("{}", MmDb::num_to_mm_enc(id));
+                // print!(" $( saved hyp $)");
               },
               ProofStep::Var(id) => {
                 print!("{}", MmDb::num_to_mm_enc(var_to_enc[&id]));
+                // print!(" $( saved var $)");
               },
               ProofStep::Assert(_) => {
                 print!("{}", MmDb::num_to_mm_enc(saved_id_to_num[*step as usize]));
+                // print!(" $( saved assert (step: {}) $)", step);
               },
               ProofStep::Saved(step) => panic!("invalid"),
             }
           },
         }
+        // println!(" $( {:?} $)", step);
       }
 
       println!(" $.");
@@ -1070,6 +1157,47 @@ impl MmDb {
     }
   }
 
+  pub fn print_with_all_deps(&self, assert_name: &str) {
+    // get all dependencies
+    let mut to_visit = HashSet::<u32>::new();
+    for (i, assert) in self.asserts.iter().enumerate() {
+      if assert.name == assert_name {
+        to_visit.insert(i as u32);
+        break;
+      }
+    }
+    let mut visited = HashSet::<u32>::new();
+    while to_visit.len() != 0 {
+      let mut to_visit_l: Vec<u32> = to_visit.drain().collect();
+      for assert_id in to_visit_l.drain(0..) {
+        if !visited.contains(&assert_id) {
+          for step in self.asserts[assert_id as usize].proof.iter() {
+            if let ProofStep::Assert(id) = step {
+              to_visit.insert(*id);
+            }
+          }
+          visited.insert(assert_id);
+        }
+      }
+    }
+
+    let mut deps: Vec<u32> = visited.drain().collect();
+    deps.sort();
+
+    // print
+    println!("$( constants $)");
+    for c in self.consts.iter() {
+      println!("\t$c {} $.", c.name);
+    }
+    println!("$( variables $)");
+    for v in self.vars.iter() {
+      println!("\t$v {} $.", v.name);
+    }
+    for assert_id in deps.iter() {
+      self.print_assert(&self.asserts[*assert_id as usize]);
+    }
+  }
+
   /**used to test that the ProofGraph from_theorem and to_theorem work
    */
   pub fn test_unfold(&self) {
@@ -1088,32 +1216,33 @@ impl MmDb {
         }
         for dep_id in thm_deps.iter() {
           let to_unfold = &self.asserts[*dep_id as usize];
-          println!("$(");
-          println!("assert disjoint_vars:");
-          for (a, b) in assert.disjoint_vars.iter() {
-            println!("\t({}, {})", a, b);
-          }
-          // TODO
-          let unfolded = to_unfold.clone();
-          // let unfolded = self.unfold(
-          //   format!("{}.unfold.{}", assert.name, to_unfold.name),
-          //   assert, *dep_id);
-          println!();
-          println!("unfolded disjoint_vars.len() = {}", unfolded.disjoint_vars.len());
-          for (a, b) in unfolded.disjoint_vars.iter() {
-            println!("\t({}, {})", a, b);
-          }
-          println!();
-          println!("proof:");
-          for step in unfolded.proof.iter() {
-            println!("\t{:?}", step);
-          }
-          println!("$)");
+          // println!("$(");
+          // println!("assert disjoint_vars:");
+          // for (a, b) in assert.disjoint_vars.iter() {
+          //   println!("\t({}, {})", a, b);
+          // }
+          let unfolded = self.unfold(
+            format!("{}.unfold.{}", assert.name, to_unfold.name),
+            assert, *dep_id);
+          // println!();
+          // println!("unfolded disjoint_vars.len() = {}", unfolded.disjoint_vars.len());
+          // for (a, b) in unfolded.disjoint_vars.iter() {
+          //   println!("\t({}, {})", a, b);
+          // }
+          // println!();
+          // println!("proof:");
+          // for step in unfolded.proof.iter() {
+          //   println!("\t{:?}", step);
+          // }
+          // println!("$)");
           // self.print_assert(&assert);
           // println!("$( ----------------------- $)");
           self.print_assert(&unfolded);
-          println!("$( ----------------------- $)");
+          // println!("$( ----------------------- $)");
+          // println!("$( {}.proof.len() = {} $)", unfolded.name, unfolded.proof.len());
+          // println!("$( checking proof:");
           self.check_proof_validity(&unfolded);
+          // println!("$)");
           // self.add_theorem(unfolded.name, unfolded.hyps, unfolded.consequent, unfolded.disjoint_vars, unfolded.deps, unfolded.proof);
         }
       }

@@ -6,7 +6,7 @@ use std::io::BufReader;
 
 use crate::mmdb::*;
 
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 enum SymbolType {
   Var,
   TypelessVar,
@@ -15,7 +15,7 @@ enum SymbolType {
   Assert,
 }
 
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 struct Symbol {
   pub t: SymbolType,
   pub id: u32,
@@ -704,7 +704,9 @@ impl Parser {
         0x21u8..=0x23u8 | 0x25u8..=0x7eu8 => symbol.push(c),
         TOK_WSP => {
           if symbol.len() > 0 {
+            // println!("symbol: {}", String::from_utf8(symbol.clone()).unwrap());
             let sym = self.sym_map.get(&symbol).unwrap();
+            // println!("sym: {:?}", sym);
             if sym.t != SymbolType::Var {
               panic!("invalid");
             }
